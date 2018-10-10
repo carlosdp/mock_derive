@@ -45,6 +45,7 @@ struct Function {
     pub name: syn::Ident,
     pub decl: syn::FnDecl,
     pub safety: Option<syn::token::Unsafe>,
+    pub skip: bool,
 }
 
 #[derive(Clone)]
@@ -103,7 +104,8 @@ fn parse_block(item: &syn::Item) -> Mockable {
                         let func = Function {
                             name: method.sig.ident.clone(),
                             decl: method.sig.decl.clone(),
-                            safety: method.sig.unsafety.clone()
+                            safety: method.sig.unsafety.clone(),
+                            skip: should_be_skipped(&method.attrs),
                         };
                         result.push(func);
                     },
@@ -426,35 +428,94 @@ fn generate_trait_fns(trait_block: &TraitBlock, mut allow_object_fallback: bool)
         let (no_return, return_type) = parse_return_type(&function.decl.output);
         let ref is_unsafe = function.safety;
         let unsafety = quote!{ #is_unsafe };
+        let (return_statement,
+             retval_statement,
+             some_arg) = make_return_tokens(no_return, &return_type);
 
         if &format!("{}", return_type) == "Self" {
             panic!("Impls with the 'Self' return type are not supported. This is due to the fact that we generate an impl of your trait for a Mock struct. Methods that return Self will return an instance on our mock struct, not YOUR struct, which is not what you want.");
         }
 
-        if !fn_args.is_instance_method {
-            allow_object_fallback = false;
-            let fn_args = parse_args(function.decl.inputs.iter());
-            let ref args_with_types = fn_args.args_with_types;
-            
-            let item_ident = name;
-            let base_name = quote!{ #item_ident };
-            let name = syn::Ident::new(&format!("{}_Method_{}", &trait_name, &base_name), proc_macro2::Span::call_site());
-            let name_lc = ident;
-            let setter_name = setter;
-            let clear_name = concat_idents("clear_", &base_name);
-            static_mocks_ctor.extend(quote!{ #name_lc: None, });
-            static_mocks_def.extend(quote!{ #name_lc: Option<#name<#return_type>>, });
-            let pubtok = quote!{ pub };
-            let (return_statement,
-                 retval_statement,
-                 some_arg) = make_return_tokens(no_return, &return_type);
-            let mock_method_body = generate_mock_method_body(&pubtok,
-                                                             &quote!{ #name });
-            static_method_body.extend(mock_method_body);
-            static_method_setup.extend(quote!{
-                #[allow(dead_code)]
-                pub fn #name_lc() -> #name<#return_type> {
-                    #name {
+        if !function.skip {
+            if !fn_args.is_instance_method {
+                allow_object_fallback = false;
+                let fn_args = parse_args(function.decl.inputs.iter());
+                let ref args_with_types = fn_args.args_with_types;
+                
+                let item_ident = name;
+                let base_name = quote!{ #item_ident };
+                let name = syn::Ident::new(&format!("{}_Method_{}", &trait_name, &base_name), proc_macro2::Span::call_site());
+                let name_lc = ident;
+                let setter_name = setter;
+                let clear_name = concat_idents("clear_", &base_name);
+                static_mocks_ctor.extend(quote!{ #name_lc: None, });
+                static_mocks_def.extend(quote!{ #name_lc: Option<#name<#return_type>>, });
+                let pubtok = quote!{ pub };
+                let (return_statement,
+                     retval_statement,
+                     some_arg) = make_return_tokens(no_return, &return_type);
+                let mock_method_body = generate_mock_method_body(&pubtok,
+                                                                 &quote!{ #name });
+                static_method_body.extend(mock_method_body);
+                static_method_setup.extend(quote!{
+                    #[allow(dead_code)]
+                    pub fn #name_lc() -> #name<#return_type> {
+                        #name {
+                            call_num: ::std::sync::Mutex::new(1),
+                            current_num: ::std::sync::Mutex::new(1),
+                            retval: ::std::sync::Mutex::new(::std::collections::HashMap::new()),
+                            lambda: ::std::sync::Mutex::new(None),
+                            should_never_be_called: false,
+                            max_calls: None,
+                            min_calls: None,
+                        }
+                    }
+                    
+                    #[allow(dead_code)]
+                    pub fn #setter_name (x: #name<#return_type>) {
+                        let value = #static_name();
+                        let mut singleton = value.inner.lock().unwrap();
+                        singleton.#name_lc = Some(x);
+                    }
+                    
+                    #[allow(dead_code)]
+                    pub fn #clear_name () {
+                        let value = #static_name();
+                        let mut singleton = value.inner.lock().unwrap();
+                        singleton.#name_lc = None;
+                    }         
+                });
+
+                static_method_impl.extend(quote!{
+                     #unsafety fn #base_name (#args_with_types) #return_statement {
+                        let value = #static_name();
+                        let singleton = value.inner.lock().unwrap();
+                        if let Some(ref method) = singleton.#name_lc {
+                            match method.call() {
+                                Some(#some_arg) => {
+                                    #retval_statement
+                                },
+                                None => {
+                                    panic!("Called a static mock function without a value set.");
+                                }
+                            }
+                        } else {
+                            panic!();
+                        }
+                    }
+                });
+
+                continue;
+            }
+
+            // This is getting a litte confusing with all of the tokens here.
+            // This is defining the methods for #ident,
+            // which is generated per method of the impl trait.
+            // we generate a getter called method_foo, and a setter called set_foo.
+            // These methods will be put on the MockImpl struct.
+            mock_impl_methods.extend(quote! {
+                pub fn #ident(&self) -> #mock_method_name<#return_type> {
+                    #mock_method_name {
                         call_num: ::std::sync::Mutex::new(1),
                         current_num: ::std::sync::Mutex::new(1),
                         retval: ::std::sync::Mutex::new(::std::collections::HashMap::new()),
@@ -464,129 +525,78 @@ fn generate_trait_fns(trait_block: &TraitBlock, mut allow_object_fallback: bool)
                         min_calls: None,
                     }
                 }
-                
-                #[allow(dead_code)]
-                pub fn #setter_name (x: #name<#return_type>) {
-                    let value = #static_name();
-                    let mut singleton = value.inner.lock().unwrap();
-                    singleton.#name_lc = Some(x);
-                }
-                
-                #[allow(dead_code)]
-                pub fn #clear_name () {
-                    let value = #static_name();
-                    let mut singleton = value.inner.lock().unwrap();
-                    singleton.#name_lc = None;
-                }         
-            });
 
-            static_method_impl.extend(quote!{
-                 #unsafety fn #base_name (#args_with_types) #return_statement {
-                    let value = #static_name();
-                    let singleton = value.inner.lock().unwrap();
-                    if let Some(ref method) = singleton.#name_lc {
-                        match method.call() {
-                            Some(#some_arg) => {
-                                #retval_statement
-                            },
-                            None => {
-                                panic!("Called a static mock function without a value set.");
+                pub fn #setter(&mut self, method: #mock_method_name<#return_type>) {
+                    self.#name_stream = Some(method);
+                }
+            });;
+
+            // The fields on the MockImpl struct.
+            fields.extend(quote! { #name_stream
+                                    : Option<#mock_method_name<#return_type>> , });
+
+            // The values that we will set in the ctor for the above defined
+            // 'fields' of MockImpl
+            ctor.extend(quote! { #name_stream : None, });
+
+            let mutable_status = fn_args.mutable_status;
+            let mut_token = quote! { #mutable_status };
+            let get_ref;
+            if mutable_status.is_some() {
+                get_ref = quote! { .as_mut() }
+            } else {
+                get_ref = quote! { .as_ref() }
+            }
+
+            let fallback;
+            if fn_args.takes_self_ownership {
+                fallback = quote! {
+                    panic!("Using a fallback for methods that take ownership of self is not supported. This is because the internals of our library do not know the size of your implementation at compile time, and will not be able to call the fallback method");
+                };
+            } else if allow_object_fallback {
+                fallback = quote! {
+                    let ref #mut_token fallback = self.fallback
+                        #get_ref
+                    .expect("Called method without either a fallback, or a set result");
+                    fallback.#name_stream(#args_with_no_self_no_types)
+                };
+            } else {
+                fallback = quote! {
+                    panic!("Using a fallback has been disabled for this use case. We cannot use a fallback for Sized Types.");
+                };
+            }
+
+            method_impls.extend(quote! {
+                #unsafety fn #name_stream(#args_with_types) #return_statement {
+                    match self.#name_stream.as_ref() {
+                        Some(method) => {
+                            match method.call() {
+                                Some(#some_arg) => {
+                                    // The mock has completed its duty.
+                                    #retval_statement
+                                },
+                                
+                                None => {
+                                    #fallback
+                                }
                             }
+                        },
+                        
+                        None => {
+                            // Check if there is a fallback
+                            #fallback
                         }
-                    } else {
-                        panic!();
                     }
                 }
             });
 
-            continue;
-        }
-
-        // This is getting a litte confusing with all of the tokens here.
-        // This is defining the methods for #ident,
-        // which is generated per method of the impl trait.
-        // we generate a getter called method_foo, and a setter called set_foo.
-        // These methods will be put on the MockImpl struct.
-        mock_impl_methods.extend(quote! {
-            pub fn #ident(&self) -> #mock_method_name<#return_type> {
-                #mock_method_name {
-                    call_num: ::std::sync::Mutex::new(1),
-                    current_num: ::std::sync::Mutex::new(1),
-                    retval: ::std::sync::Mutex::new(::std::collections::HashMap::new()),
-                    lambda: ::std::sync::Mutex::new(None),
-                    should_never_be_called: false,
-                    max_calls: None,
-                    min_calls: None,
-                }
-            }
-
-            pub fn #setter(&mut self, method: #mock_method_name<#return_type>) {
-                self.#name_stream = Some(method);
-            }
-        });;
-
-        // The fields on the MockImpl struct.
-        fields.extend(quote! { #name_stream
-                                : Option<#mock_method_name<#return_type>> , });
-
-        // The values that we will set in the ctor for the above defined
-        // 'fields' of MockImpl
-        ctor.extend(quote! { #name_stream : None, });
-
-        let mutable_status = fn_args.mutable_status;
-        let mut_token = quote! { #mutable_status };
-        let get_ref;
-        if mutable_status.is_some() {
-            get_ref = quote! { .as_mut() }
         } else {
-            get_ref = quote! { .as_ref() }
-        }
-
-        let fallback;
-        if fn_args.takes_self_ownership {
-            fallback = quote! {
-                panic!("Using a fallback for methods that take ownership of self is not supported. This is because the internals of our library do not know the size of your implementation at compile time, and will not be able to call the fallback method");
-            };
-        } else if allow_object_fallback {
-            fallback = quote! {
-                let ref #mut_token fallback = self.fallback
-                    #get_ref
-                .expect("Called method without either a fallback, or a set result");
-                fallback.#name_stream(#args_with_no_self_no_types)
-            };
-        } else {
-            fallback = quote! {
-                panic!("Using a fallback has been disabled for this use case. We cannot use a fallback for Sized Types.");
-            };
-        }
-
-        let (return_statement,
-             retval_statement,
-             some_arg) = make_return_tokens(no_return, &return_type);
-
-        method_impls.extend(quote! {
-            #unsafety fn #name_stream(#args_with_types) #return_statement {
-                match self.#name_stream.as_ref() {
-                    Some(method) => {
-                        match method.call() {
-                            Some(#some_arg) => {
-                                // The mock has completed its duty.
-                                #retval_statement
-                            },
-                            
-                            None => {
-                                #fallback
-                            }
-                        }
-                    },
-                    
-                    None => {
-                        // Check if there is a fallback
-                        #fallback
-                    }
+            method_impls.extend(quote! {
+                #unsafety fn #name_stream(#args_with_types) #return_statement {
+                    unimplemented!();
                 }
-            }
-        });
+            });
+        }
     }
 
     if allow_object_fallback {
@@ -599,7 +609,7 @@ fn generate_trait_fns(trait_block: &TraitBlock, mut allow_object_fallback: bool)
             }
         });
     }
-    
+
     (mock_impl_methods,
      fields,
      ctor,
@@ -735,7 +745,7 @@ fn parse_trait(trait_block: TraitBlock, raw_trait: &syn::Item) -> proc_macro2::T
     };
 
     let mut map = BOUNDS_MAP.lock().unwrap();
-    let name_string = format!("{}", trait_name);
+    let name_string = format!("{}", &trait_name);
     map.insert(name_string, trait_block.clone());
 
     stream
@@ -937,6 +947,103 @@ fn make_mut_static(ident: proc_macro2::TokenStream, ty: proc_macro2::TokenStream
     }
 }
 
+fn should_be_skipped(attrs: &[syn::Attribute]) -> bool {
+    match get_attr_meta(attrs, "skip") {
+        Some(meta) => {
+            match get_meta_string_value(&meta) {
+                Some(_) => true,
+                None => false,
+            }
+        },
+        None => false,
+    }
+}
+
+fn get_attr_meta(attrs: &[syn::Attribute], name: &str) -> Option<syn::Meta> {
+    let mut mock_attrs: Vec<syn::Meta> = attrs.iter()
+        .filter_map(|attr| attr.interpret_meta())
+        .filter_map(|m| match m {
+            syn::Meta::List(list) => {
+                if list.ident == "mock" {
+                    list.nested.into_iter().filter_map(|nested| match nested {
+                        syn::NestedMeta::Meta(meta) => {
+                            if meta.name() == name {
+                                Some(meta)
+                            } else {
+                                None
+                            }
+                        },
+                        _ => None,
+                    }).last()
+                } else {
+                    None
+                }
+            },
+            _ => None,
+        }).collect();
+
+    if mock_attrs.len() > 0 {
+        Some(mock_attrs.remove(0))
+    } else {
+        None
+    }
+}
+
+fn get_meta_string_value(meta: &syn::Meta) -> Option<String> {
+    match meta {
+        syn::Meta::Word(ident) => {
+            Some(ident.to_string())
+        },
+        syn::Meta::NameValue(nv) => {
+            match nv.lit {
+                syn::Lit::Str(ref s) => Some(s.value()),
+                _ => None,
+            }
+        },
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn get_meta_string_values(meta: &syn::Meta) -> Option<Vec<String>> {
+    use syn::NestedMeta;
+
+    match meta {
+        syn::Meta::List(list) => {
+            Some(list.nested.iter().filter_map(|nested| {
+                match nested {
+                    NestedMeta::Literal(lit) => {
+                        match lit {
+                            syn::Lit::Str(ref s) => Some(s.value()),
+                            _ => None,
+                        }
+                    },
+                    _ => None,
+                }
+            }).collect())
+        },
+        _ => None,
+    }
+}
+
+fn strip_mock_attrs(item: &mut syn::Item) {
+    match item {
+        syn::Item::Trait(ref mut trait_item) => {
+            trait_item.items.iter_mut().for_each(|i| match i {
+                syn::TraitItem::Method(ref mut method) => {
+                    method.attrs = method.attrs.iter().filter(|attr| match attr.interpret_meta() {
+                        Some(ref meta) => meta.name() != "mock",
+                        None => true,
+                    }).cloned().collect();
+                },
+                _ => (),
+            });
+        },
+        syn::Item::ForeignMod(_) => (),
+        _ => (),
+    }
+}
+
 struct MockInput {
     pub item: syn::Item,
 }
@@ -955,7 +1062,10 @@ impl Parse for MockInput {
 #[proc_macro_attribute]
 pub fn mock(_attr_ts: TokenStream, impl_ts: TokenStream) -> TokenStream {
     let input = parse_macro_input!(impl_ts as MockInput);
-    let raw_item = input.item;
+    let raw_item = input.item.clone();
+    let mut stripped_item = input.item.clone();
+
+    strip_mock_attrs(&mut stripped_item);
 
     let stream = match parse_block(&raw_item) {
         Mockable::ForeignFunctions(impl_block) => {
@@ -963,7 +1073,7 @@ pub fn mock(_attr_ts: TokenStream, impl_ts: TokenStream) -> TokenStream {
         },
 
         Mockable::Trait(trait_block) => {
-            parse_trait(trait_block, &raw_item)
+            parse_trait(trait_block, &stripped_item)
         }
     };
 
@@ -978,7 +1088,7 @@ pub fn mock(_attr_ts: TokenStream, impl_ts: TokenStream) -> TokenStream {
        #[cfg(not(test))]
        macro_rules! mock_generate {
           () => {
-              #raw_item
+              #stripped_item
            }
        }
 

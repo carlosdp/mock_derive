@@ -89,6 +89,12 @@ trait UnsafeStaticMock {
     unsafe fn st_method() -> usize;
 }
 
+#[mock]
+trait SkipMethod {
+    #[mock(skip)]
+    fn borrow(&self) -> &usize;
+}
+
 // @TODO support
 /*
 trait BaseG<T> {
@@ -174,4 +180,11 @@ fn static_fn_test() {
     MockStaticMethod::set_st_method(mock);
     assert!(MockStaticMethod::st_method() == 25);
     MockStaticMethod::clear_st_method();
+}
+
+#[test]
+#[should_panic]
+fn mock_skip_method() {
+    let mock = MockSkipMethod::new();
+    assert!(mock.borrow() == &25);
 }
