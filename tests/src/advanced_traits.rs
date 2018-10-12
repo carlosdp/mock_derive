@@ -36,7 +36,17 @@ trait Derived : Base {
 }
 
 #[mock]
-trait Compisition : Base + Derived {
+trait SecondDerived : Base {
+    fn sub(&self, x: i32, y: usize) -> usize;
+}
+
+#[mock]
+trait Composition : Base + Derived {
+    fn x(&self) -> isize;
+}
+
+#[mock]
+trait OverlappingComposition : Base + Derived + SecondDerived {
     fn x(&self) -> isize;
 }
 
@@ -116,12 +126,30 @@ fn mock_derived() {
     mock_derived.set_sub(method_derived);
     assert!(mock_derived.sub(0, 0) == 25);
 
-    let method_base = mock_derived.method_add()
+    let method_base = mock_derived.method_Base_add()
         .called_once()
         .return_result_of(|| 25);
 
-    mock_derived.set_add(method_base);
+    mock_derived.set_Base_add(method_base);
     assert!(mock_derived.add(0, 0) == 25);
+}
+
+#[test]
+fn mock_overlapping_composition() {
+    let mut mock_composition = MockOverlappingComposition::new();
+    let method_derived = mock_composition.method_Derived_sub()
+        .called_once()
+        .return_result_of(|| 25);
+    
+    mock_composition.set_Derived_sub(method_derived);
+    assert!(Derived::sub(&mock_composition, 0, 0) == 25);
+
+    let method_second = mock_composition.method_SecondDerived_sub()
+        .called_once()
+        .return_result_of(|| 20);
+
+    mock_composition.set_SecondDerived_sub(method_second);
+    assert!(SecondDerived::sub(&mock_composition, 0, 0) == 20);
 }
 
 #[test]

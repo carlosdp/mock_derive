@@ -388,7 +388,7 @@ fn generate_mock_method_name(trait_block: &TraitBlock) -> (proc_macro2::TokenStr
     (quote! { #struct_name }, quote! { #mock_method_name })
 }
 
-fn generate_trait_fns(trait_block: &TraitBlock, mut allow_object_fallback: bool)
+fn generate_trait_fns(trait_block: &TraitBlock, mut allow_object_fallback: bool, include_trait_in_idents: bool)
                       -> (proc_macro2::TokenStream,
                           proc_macro2::TokenStream,
                           proc_macro2::TokenStream,
@@ -415,13 +415,17 @@ fn generate_trait_fns(trait_block: &TraitBlock, mut allow_object_fallback: bool)
 
     let (_, mock_method_name) = generate_mock_method_name(trait_block);
     let static_name = generate_static_name(trait_name);
+
+    let method_prefix = &format!("method_{}", if include_trait_in_idents { format!("{}_", trait_name) } else { "".to_owned() });
+    let setter_prefix = &format!("set_{}", if include_trait_in_idents { format!("{}_", trait_name) } else { "".to_owned() });
     // For each method in the Impl block, we create a "method_" name function that returns an
     // object to mutate
     for function in trait_functions {
         let ref name = function.name;
         let name_stream = quote! { #name };
-        let ident = concat_idents("method_", &name_stream);
-        let setter = concat_idents("set_", &name_stream);
+        let ident = concat_idents(method_prefix, &name_stream);
+        let setter = concat_idents(setter_prefix, &name_stream);
+        let ref field_name = if include_trait_in_idents { syn::Ident::new(&format!("{}_{}", trait_name, &name_stream), proc_macro2::Span::call_site()) } else { name.clone() };
         let fn_args = parse_args(function.decl.inputs.iter());
         let ref args_with_no_self_no_types = fn_args.args_with_no_self_no_types;
         let ref args_with_types = fn_args.args_with_types;
@@ -527,17 +531,17 @@ fn generate_trait_fns(trait_block: &TraitBlock, mut allow_object_fallback: bool)
                 }
 
                 pub fn #setter(&mut self, method: #mock_method_name<#return_type>) {
-                    self.#name_stream = Some(method);
+                    self.#field_name = Some(method);
                 }
             });;
 
             // The fields on the MockImpl struct.
-            fields.extend(quote! { #name_stream
+            fields.extend(quote! { #field_name
                                     : Option<#mock_method_name<#return_type>> , });
 
             // The values that we will set in the ctor for the above defined
             // 'fields' of MockImpl
-            ctor.extend(quote! { #name_stream : None, });
+            ctor.extend(quote! { #field_name : None, });
 
             let mutable_status = fn_args.mutable_status;
             let mut_token = quote! { #mutable_status };
@@ -568,7 +572,7 @@ fn generate_trait_fns(trait_block: &TraitBlock, mut allow_object_fallback: bool)
 
             method_impls.extend(quote! {
                 #unsafety fn #name_stream(#args_with_types) #return_statement {
-                    match self.#name_stream.as_ref() {
+                    match self.#field_name.as_ref() {
                         Some(method) => {
                             match method.call() {
                                 Some(#some_arg) => {
@@ -642,7 +646,7 @@ fn parse_trait(trait_block: TraitBlock, raw_trait: &syn::Item) -> proc_macro2::T
          static_method_impl,
          static_method_body,
          static_mocks_ctor,
-         static_mocks_def) = generate_trait_fns(&trait_block, !trait_block.impls_sized);
+         static_mocks_def) = generate_trait_fns(&trait_block, !trait_block.impls_sized, false);
     
     let mock_method_body = generate_mock_method_body(&pubtok, &mock_method_name);
     let ref ty_param_bound = trait_block.ty_bounds;
@@ -675,7 +679,7 @@ fn parse_trait(trait_block: TraitBlock, raw_trait: &syn::Item) -> proc_macro2::T
                          _,
                          _,
                          _,
-                         _) = generate_trait_fns(&impl_body, false);
+                         _) = generate_trait_fns(&impl_body, false, true);
 
                     mock_impl_methods.extend(quote! { #base_mock_impl_methods });
                     fields.extend(quote! { #base_fields });
