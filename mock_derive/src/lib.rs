@@ -212,7 +212,7 @@ fn generate_mock_method_body(pubtok: &proc_macro2::TokenStream, mock_method_name
             pub call_num: ::std::sync::Mutex<usize>,
             pub current_num: ::std::sync::Mutex<usize>,
             pub retval: ::std::sync::Mutex<::std::collections::HashMap<usize, __RESULT_NAME>>,
-            pub lambda: ::std::sync::Mutex<Option<Box<FnMut() -> __RESULT_NAME>>>,
+            pub lambda: ::std::sync::Mutex<Option<Box<FnMut() -> __RESULT_NAME + Send>>>,
             pub should_never_be_called: bool,
             pub max_calls: Option<usize>,
             pub min_calls: Option<usize>,
@@ -322,7 +322,7 @@ fn generate_mock_method_body(pubtok: &proc_macro2::TokenStream, mock_method_name
             }
 
             pub fn return_result_of<F: 'static>(self, lambda: F) -> Self
-                where F: FnMut() -> __RESULT_NAME {
+                where F: FnMut() -> __RESULT_NAME + Send {
                 {
                     let mut lambda_result = self.lambda.lock().unwrap();
                     *lambda_result = Some(Box::new(lambda));
@@ -952,7 +952,11 @@ fn make_mut_static(ident: proc_macro2::TokenStream, ty: proc_macro2::TokenStream
 }
 
 fn should_be_skipped(attrs: &[syn::Attribute]) -> bool {
-    match get_attr_meta(attrs, "skip") {
+    has_flag("skip", attrs)
+}
+
+fn has_flag(flag: &str, attrs: &[syn::Attribute]) -> bool {
+    match get_attr_meta(attrs, flag) {
         Some(meta) => {
             match get_meta_string_value(&meta) {
                 Some(_) => true,
